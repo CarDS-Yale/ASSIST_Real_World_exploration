@@ -1,0 +1,201 @@
+---
+title: "PROMISE subanalysis"
+output: html_notebook
+---
+
+```{r}
+# Loading the processed data from the EHJ paper (https://pubmed.ncbi.nlm.nih.gov/33881513/)
+
+# clean the environment
+rm(list=ls()) 
+
+# load required libraries
+library(plyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(tableone)
+
+# load the processed data with the baseline predictors/outcomes per our previous work
+data <- read.csv("your-wd/promise_imputed.csv", header = TRUE, sep =",", na.strings="") # file for analysis with imputed baseline predictors per https://pubmed.ncbi.nlm.nih.gov/33881513/ 
+
+# define patient IDs
+data$patnumb <- paste("PROMISE", str_pad(data$X, 5, pad = "0"), sep="")
+sel_ids <- unique(data$patnumb)
+
+# define prediction
+data$predicted <- ifelse(data$coef_dmicuac<0, "anatomical", "functional") # per https://pubmed.ncbi.nlm.nih.gov/33881513/ 
+table(data$predicted)
+
+# define concordance (1=concordance, 0=no concordance)
+data$concordance <- ifelse((data$predicted == "anatomical" & data$arm==1), 1, 
+                           ifelse((data$predicted == "functional" & data$arm==0), 1, 0))
+
+data$pairs <- ifelse((data$predicted == "anatomical" & data$arm==1), "anatomical>anatomical", 
+                           ifelse((data$predicted == "functional" & data$arm==0), "functional>functional", 
+                                  ifelse((data$predicted == "anatomical" & data$arm==0), "anatomical>functional",
+                                         ifelse((data$predicted == "functional" & data$arm==1), "functional>anatomical", NA))))
+# Load test results
+tst <- read.csv("/your-path/PROMISE_2018a/data/CSV/ANALDATA/diagtst.csv", header = TRUE, sep =",", na.strings=".")
+```
+
+
+```{r}
+# Generate CCTA result data
+
+# Define >=50% LM disease on CCTA
+tst$lm_cta <- ifelse(tst$LMNSTEN1 %in% c(3,4,5), 1, ifelse(tst$LMNSTEN1 %in% c(1,2,6,97), 0, NA))
+tst$lad_cta <- ifelse(tst$LADSTEN1 %in% c(3,4,5), 1, ifelse(tst$LADSTEN1 %in% c(1,2,6,97), 0, NA))
+tst$prxlad_cta <- ifelse(tst$PRXSTEN1 %in% c(3,4,5), 1, ifelse(tst$PRXSTEN1 %in% c(1,2,6,97), 0, NA))
+tst$rca_cta <- ifelse(tst$RCASTEN1 %in% c(3,4,5), 1, ifelse(tst$RCASTEN1 %in% c(1,2,6,97), 0, NA))
+tst$lcx_cta <- ifelse(tst$LCXSTEN1 %in% c(3,4,5), 1, ifelse(tst$LCXSTEN1 %in% c(1,2,6,97), 0, NA))
+
+# Define composite of LM or pLAD
+tst$lm_prxlad_cta <- ifelse(tst$prxlad_cta==1, 1, ifelse(tst$lm_cta==1, 1, ifelse((tst$lm_cta==0|tst$prxlad_cta==0), 0, NA)))
+
+print("Disease in the LM or pLAD:")
+table(tst$lm_prxlad_cta)
+
+# Define no significant CAD (no or <50% disease)
+tst$nocad <- ifelse((tst$LMNSTEN1 %in% c(1,2) & tst$PRXSTEN1 %in% c(1,2) & tst$LADSTEN1 %in% c(1,2)
+                      & tst$RCASTEN1 %in% c(1,2) & tst$LCXSTEN1 %in% c(1,2)), 1,
+                    ifelse((tst$LMNSTEN1 %in% c(3,4,5,97) | tst$PRXSTEN1 %in% c(3,4,5,97) | tst$LADSTEN1 %in% c(3,4,5,97)
+                      | tst$RCASTEN1 %in% c(3,4,5,97) | tst$LCXSTEN1 %in% c(3,4,5,97)), 0, NA))
+
+print("No disease >=50%:")
+table(tst$nocad)
+
+# Define lack of coronary atherosclerosis (normal coronaries throughout)
+tst$nocad0 <- ifelse((tst$LMNSTEN1 %in% c(1) & tst$PRXSTEN1 %in% c(1) & tst$LADSTEN1 %in% c(1)
+                     & tst$RCASTEN1 %in% c(1) & tst$LCXSTEN1 %in% c(1)), 1, 
+                     ifelse((tst$LMNSTEN1 %in% c(2,3,4,5,97) | tst$PRXSTEN1 %in% c(2,3,4,5,97) | tst$LADSTEN1 %in% c(2,3,4,5,97)
+                      | tst$RCASTEN1 %in% c(2,3,4,5,97) | tst$LCXSTEN1 %in% c(2,3,4,5,97)), 0, NA))
+
+print("No coronary atherosclerosis:")
+table(tst$nocad0)
+
+# Define 3vCAD
+
+tst$num_cad <- tst$lad_cta + tst$rca_cta + tst$lcx_cta
+table(tst$num_cad)
+tst$lm_or_3v <- ifelse(tst$lm_cta==1, 1,
+                       ifelse((tst$LADSTEN1 %in% c(4,5))&(tst$RCASTEN1 %in% c(4,5))&(tst$LCXSTEN1 %in% c(4,5)), 1, 0))
+table(tst$lm_or_3v)
+
+# Keep the first cta for each patient
+ccta <- tst[order(tst$patnumb, tst$ditstdt),]
+ccta <- ccta %>% group_by(patnumb) %>% filter(row_number()==1)
+ccta <- ccta[,c("patnumb", "lm_prxlad_cta", "nocad", "nocad0", "lm_or_3v")]
+```
+
+
+```{r}
+# Join all
+all <- merge(data, ccta, by="patnumb", all.x=TRUE)
+```
+
+```{r}
+# Split in the two arms
+cta <- all[all["arm"]==1,]
+func <- all[all["arm"]==0,]
+```
+
+
+```{r}
+# Create TableOne
+tableOne <- CreateTableOne(vars = c("age", "sex", "ethnic", "race",
+                                    "htn", "diab", "ihd", "cadequi", "dhstia", "dhsstr", "gfr", "pad",
+                                    "smoke",
+                                    "choles", "hdl", "bmi",
+                                    "betablk_bl", "statin_bl", "tri_bl"), 
+                           factorVars = c("sex", "ethnic", "race",
+                                    "htn", "diab", "ihd", "cadequi", "dhstia", "pad",
+                                    "smoke", "dhsstr", "tri_bl",
+                                    "betablk_bl", "statin_bl", "antiplatelet_bl"), 
+                           data = cta#, #strata = "strategy", test=TRUE
+)
+tableOne_mat <- print(tableOne, nonnormal = c("age", "bmi", "gfr", "choles", "hdl"))
+tableOne_mat
+write.csv(tableOne_mat, "your-output/tableOne_promise_cta.csv", row.names = TRUE)
+
+```
+
+
+```{r}
+# Compare prevalence of proximal disease by ASSIST group
+
+# Outcome #1: LM or proximal LAD disease
+# Unadjusted 2x2 tabulation
+tbl <- table(cta$predicted, cta$lm_prxlad_cta)
+tbl
+chisq.test(tbl)
+tb.prop <- prop.table(tbl, 1)
+tb.prop
+
+# Calculate binomial confidence intervals
+library(Hmisc)
+binconf(x=tbl[1,2], n=(tbl[1,2]+tbl[1,1]), alpha=.05)
+binconf(x=tbl[2,2], n=(tbl[2,2]+tbl[2,1]), alpha=.05)
+
+# Adjusted GLM model
+model1 <- glm(lm_prxlad_cta ~ concordance + age + sex + bmi 
+              + diab + choles + hdl + gfr + bpsys + statin_1 + antiplatelet_1 + betablk_1
+              + htn + smoke, data=cta, family="binomial")
+summary(model1)
+exp(cbind(OR = coef(model1), confint(model1)))
+```
+
+
+```{r}
+# Outcome #2: no CAD (inverse = any CAD)
+
+# Unadjusted 2x2 tabulation
+tbl <- table(cta$predicted, cta$anycad)
+tbl
+chisq.test(tbl)
+tb.prop <- prop.table(tbl, 1)
+tb.prop
+
+# Calculate binomial confidence intervals
+library(Hmisc)
+binconf(x=tbl[1,2], n=(tbl[1,2]+tbl[1,1]), alpha=.05)
+binconf(x=tbl[2,2], n=(tbl[2,2]+tbl[2,1]), alpha=.05)
+
+# Adjusted GLM model
+model1 <- glm(anycad ~ concordance + age + sex + bmi 
+              + diab + choles + hdl + gfr + bpsys + statin_1 + antiplatelet_1 + betablk_1
+              + htn + smoke, data=cta, family="binomial")
+summary(model1)
+exp(cbind(OR = coef(model1), confint(model1)))
+```
+
+
+
+```{r}
+# Outcome #3: LM/3vCAD
+
+# Unadjusted 2x2 tabulation
+tbl <- table(cta$predicted, cta$lm_or_3v)
+tbl
+chisq.test(tbl)
+tb.prop <- prop.table(tbl, 1)
+tb.prop
+
+# Calculate binomial confidence intervals
+library(Hmisc)
+binconf(x=tbl[1,2], n=(tbl[1,2]+tbl[1,1]), alpha=.05)
+binconf(x=tbl[2,2], n=(tbl[2,2]+tbl[2,1]), alpha=.05)
+
+# Adjusted GLM model
+model1 <- glm(lm_or_3v ~ concordance + age + sex + bmi 
+              + diab + choles + hdl + gfr + bpsys + statin_1 + antiplatelet_1 + betablk_1
+              + htn + smoke, data=cta, family="binomial")
+summary(model1)
+exp(cbind(OR = coef(model1), confint(model1)))
+```
+
+
+
+
+
+

@@ -1,0 +1,467 @@
+---
+title: "R Notebook for Yale EHR assist analysis"
+output: html_notebook
+---
+
+```{r}
+# Load data and packages
+
+## Clean environment
+rm(list=ls())
+
+## Load packages
+library(dplyr)
+library(knitr)
+library(tableone)
+library(pollster)
+library(pscl)
+library(missRanger)
+library(Matrix)
+library(survival)
+library(survminer)
+library(Publish)
+
+## Load ASSIST model and show the feature names expected by the model
+assist <- readRDS("/path-to-xgboost-model/xgboost.RDS")
+
+## Review the naming of the features that go into ASSIST calculation
+assist$feature_names
+
+## Load CSV file for EHR data
+ehr <- read.csv("/ehr-extract/ASSIST_Yale_final_20240116b.csv")
+```
+
+```{r}
+# Harmonize naming of variables, with the original xgboost from PROMISE
+ehr$sex.2 <- ifelse(ehr$sex == "Female", 1, ifelse(ehr$sex == "Male", 0, NA))
+ehr$age <- ehr$age_test
+ehr <- ehr %>% dplyr::rename(choles = cholesterol, 
+                      htn.1 = htn,
+                      diab.1 = dm,
+                      antiplatelet_1.1 = antiplatelet,
+                      betablk_1.1 = beta_blocker,
+                      smoke.3 = smoker_former,
+                      smoke.2 = smoker_active,
+                      statin_1.1 = statin)
+```
+
+```{r}
+# Create TableOne for our analysis [Table 1]
+tableOne <- CreateTableOne(vars = c("age", "sex.2", "ethnicity", "race", "cardiac_test_spec",
+                                    "htn.1", "diab.1", "ihd", "ami", "stroke", "ckd", "pad", "smoke.2", "smoke.3",
+                                    'sbp', 'dbp', "choles", "hdl", "bmi", "cabg_pci", "inpatient", "pharmacological",
+                                    "antihypertensive", "betablk_1.1", "statin_1.1", "antiplatelet_1.1"), 
+                           factorVars = c("ethnicity", "race", "sex.2", "htn.1", "diab.1", "ihd", "ami", "stroke", "ckd", "pad", "inpatient", "pharmacological",
+                                          "smoke.2", "smoke.3", "cabg_pci", "cardiac_test_spec", "antihypertensive",
+                                          "betablk_1.1", "statin_1.1", "antiplatelet_1.1"), 
+                           data = ehr, strata = "strategy", test=TRUE
+)
+
+tableOne_mat <- print(tableOne, #nonnormal = c("age", "bmi", "choles", "hdl", "sbp", "dbp"), # uncomment to get median/IQR
+                      smd = TRUE) # getting standardized mean difference
+
+#write.csv(tableOne_mat, "/path-to-output/tableOne_R1.csv", row.names = TRUE)
+```
+
+```{r}
+# Impute predictors
+
+## set random seeds
+set.seed(123) 
+
+## subset columns of interest
+ehr_forimput <- ehr %>% select(age, bmi, sex.2, ethnicity, race, sbp, dbp, choles, hdl, htn.1, diab.1, ami, 
+                               ihd, stroke, heart_failure, ckd, pad,
+                               antiplatelet_1.1, betablk_1.1, antihypertensive,
+                               smoke.3, smoke.2, statin_1.1)
+
+## impute
+imputed_values <- missRanger(ehr_forimput)
+
+## replace missing with imputed features
+ehr$choles <- imputed_values[, "choles"]
+ehr$hdl <- imputed_values[, "hdl"]
+ehr$sex.2 <- imputed_values[,"sex.2"]
+ehr$bmi <- imputed_values[,"bmi"]
+ehr$age <- imputed_values[,"age"]
+ehr$sbp <- imputed_values[,"sbp"]
+ehr$dbp <- imputed_values[,"dbp"]
+```
+
+```{r}
+# Calculate PCE
+
+library("PooledCohort")
+
+## Rename variables
+age_years <- ehr$age
+race <- ifelse(ehr$race=="White", "white", "black")
+sex <- ifelse(ehr$sex=="Female", "female", "male")
+smoke_current <- ifelse(ehr$smoke.2==1, "yes", "no")
+chol_total_mgdl <- ehr$choles
+chol_hdl_mgdl <- ehr$hdl
+bp_sys_mmhg <- ehr$sbp
+bp_meds <- ifelse(ehr$antihypertensive==1, "yes", "no")
+diabetes <- ifelse(ehr$diab.1==1, "yes", "no")
+
+## Calculate
+pce <- predict_10yr_ascvd_risk(
+    age_years, 
+    race,
+    sex,
+    smoke_current,
+    chol_total_mgdl,
+    chol_hdl_mgdl,
+    bp_sys_mmhg,
+    bp_meds,
+    diabetes,
+    equation_version = "Yadlowsky_2018", # options: Yadlowsky_2018 or Goff_2013
+    override_boundary_errors = TRUE#,
+)
+
+## Assign to main df
+ehr$pce <- pce
+```
+
+```{r}
+# Compute ASSIST-derived estimates
+
+## Create dataframe for inference
+ehr_sel <- ehr[,assist$feature_names]
+nhr <- rnorm(nrow(ehr_sel), 1, 0.5) ### create dummy label
+ehr_sel <- cbind(nhr, ehr_sel) ### merge
+new_tst <- sparse.model.matrix(nhr ~ .-1, data = ehr_sel) ### create matrix for prediction
+
+# Get ASSIST-derived continuous iHR
+ehr$prediction <- predict(assist, newdata = new_tst)
+
+## Get ASSIST-predicted modality
+ehr$assist_rec <- ifelse(ehr$prediction<0, "anatomical", "functional")
+```
+
+```{r}
+# Summarize; how many with ASSIST-recommended functional vs anatomical testing?
+table(ehr$assist_rec)
+```
+
+```{r}
+# Define ASSIST-real-world concordance flag (0=="discordance"; 1=="concordance")
+ehr$concordance <- ifelse(ehr$assist_rec=="anatomical" & ehr$strategy=="anatomical", 1,
+                          ifelse(ehr$assist_rec=="functional" & ehr$strategy=="functional", 1, 0))
+table(ehr$concordance)
+```
+
+```{r}
+# Summarize PCE estimates, as surrogate of ASCVD - and compare between groups (per reviewer)
+median(ehr[(ehr$ihd==0)&(ehr$strategy=="functional"),]$pce)
+quantile(ehr[(ehr$ihd==0)&(ehr$strategy=="functional"),]$pce, probs = c(0.25, 0.75))
+median(ehr[(ehr$ihd==0)&(ehr$strategy=="anatomical"),]$pce)
+quantile(ehr[(ehr$ihd==0)&(ehr$strategy=="anatomical"),]$pce, probs = c(0.25, 0.75))
+
+# Compare by Mann-Whitney-Wilcoxon given
+test_result <- wilcox.test(ehr[(ehr$ihd==0)&(ehr$strategy=="functional"),]$pce, ehr[(ehr$ihd==0)&(ehr$strategy=="anatomical"),]$pce)
+print(test_result)
+```
+
+```{r}
+# Extract propensity score
+
+## Relevel variables
+ehr$ethnicity <- factor(ehr$ethnicity)
+ehr$race <- factor(ehr$race)
+ehr$ethnicity<- relevel(ehr$ethnicity, ref = "Non-Hispanic")
+ehr$race<- relevel(ehr$race, ref = "White")
+
+## Estimate propensity score for anatomical testing
+ehr$anatomical <- ifelse(ehr$strategy=="anatomical", 1, 0)
+model_prop <- glm(anatomical ~ age + sex.2 + ethnicity + race + bmi + year
+                  + choles + hdl + htn.1 + diab.1 + ihd + ckd
+                  + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3,
+                  family = binomial, data = ehr)
+
+## Summarize model
+summary(model_prop)
+
+## Extract propensity scores
+propensity_scores <- predict(model_prop, type = "response")
+```
+
+```{r}
+# Estimate (McFadden's pseudo-R2)
+with(summary(model_prop), 1 - deviance/null.deviance)
+```
+
+```{r}
+# Estimate predictors of concordance and discordance
+
+## Rescale for more interpretable OR
+ehr$propensity_score <- propensity_scores*100
+ehr$choles10 <- ehr$choles/10
+ehr$hdl10 <- ehr$hdl/10
+ehr$age10 <- ehr$age/10
+ehr$bmi10 <- ehr$bmi/10
+
+## Fit and summarize the model
+model_conc <- glm(concordance ~ age10 + sex.2 + ethnicity + race + bmi10
+                  + choles10 + hdl10 + htn.1 + diab.1 + ihd + ckd
+                  + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3,
+                  family=binomial, data = ehr)
+
+## Now write in a csv file
+summary_model <- summary(model_conc)
+summary_model
+odds_ratios <- exp(coef(model_conc))
+ci <- exp(confint(model_conc))
+p_values <- summary_model$coefficients[, "Pr(>|z|)"]
+se <- summary_model$coefficients[, "Std. Error"]
+beta <- summary_model$coefficients[, "Estimate"]
+
+results_df <- data.frame(
+  Variable = names(odds_ratios),
+  Beta = beta,
+  SE = se,
+  OR = odds_ratios,
+  CI_low = ci[, 1],
+  CI_high = ci[, 2],
+  P_value = p_values
+)
+results_df$CI_formatted <- paste("Beta (SE): ", round(results_df$Beta, 2), " (", round(results_df$SE, 2), "); ", round(results_df$OR, 2), "[95% CI:", round(results_df$CI_low, 2), "-", round(results_df$CI_high, 2), "],", round(results_df$P_value, 3))
+results_df
+write.csv(results_df, file = "/path-to-output/conc_models_20240116.csv", row.names = FALSE)
+
+```
+
+```{r}
+results_df
+```
+
+```{r}
+# Estimate (McFadden's pseudo-R2)
+with(summary(model_conc), 1 - deviance/null.deviance)
+```
+
+```{r}
+# Estimate correlation between PCE and ASSIST prediction among those without iHD
+filtered_data <- ehr#[ehr$ihd == 0, ]  # Filter data where ehr$ihd is equal to 0
+correlation <- cor(filtered_data$pce, filtered_data$prediction, method = "spearman")
+correlation
+```
+
+```{r}
+# Summarize PCE across testing strategy for those without iHD
+quantile(ehr[(ehr$ihd==0)&(ehr$strategy=="functional"),]$pce, probs = c(0.25, 0.75))
+quantile(ehr[(ehr$ihd==0)&(ehr$strategy=="anatomical"),]$pce, probs = c(0.25, 0.75))
+
+```
+
+```{r}
+# Association between ASSIST- and clinician-guided assignment and events
+
+## prepare data
+table(ehr$ami2)
+table(ehr$death)
+summary(ehr$time_to_censor/365.25)
+ehr$time_to_MACE2_2 <- ifelse(is.na(ehr$time_to_MACE2_2), 0.001, ehr$time_to_MACE2_2) # ensure minimal f/u time is 0.001, not applicable since no nan
+median(ehr$time_to_MACE2_2)
+quantile(ehr$time_to_MACE2_2, probs = c(0.25, 0.75))
+
+## fit model
+cox_model <- coxph(Surv(time_to_MACE2_2, MACE2_2) ~ assist_rec + strategy
+                   + age + sex.2 + ethnicity + race + bmi 
+                   + choles + hdl 
+                   + htn.1 + diab.1 + ckd + ihd
+                   + antiplatelet_1.1 + statin_1.1 + betablk_1.1 
+                   + smoke.2 + smoke.3
+                   + propensity_score
+                   ,data = ehr)
+summary(cox_model)
+```
+
+```{r}
+## Primary outcome analysis - association between concordance and events
+table(ehr$ami2)
+table(ehr$death)
+summary(ehr$time_to_censor/365.25)
+
+## Overall analysis
+cox_model <- coxph(Surv(time_to_MACE2_2, MACE2_2) ~ concordance
+                   + age + sex.2 + ethnicity + race + bmi 
+                   + choles + hdl 
+                   + htn.1 + diab.1 + ckd + ihd
+                   + antiplatelet_1.1 + statin_1.1 + betablk_1.1 
+                   + smoke.2 + smoke.3
+                   + propensity_score
+                   ,data = ehr)
+
+## Summarize model
+summary(cox_model)
+```
+
+```{r}
+# Assess whether proportionality assumption is violated
+ehr$time_to_MACE2_2_cens <- ifelse(ehr$time_to_MACE2_2>365.25*5, 365.25*5, ehr$time_to_MACE2_2)
+ehr$MACE2_2_cens <- ifelse((ehr$MACE2_2==1)&(ehr$time_to_MACE2_2>365.25*5), 0, ehr$MACE2_2)
+cox_model <- coxph(Surv(time_to_MACE2_2_cens, MACE2_2_cens) ~ concordance
+                   ,data = ehr)             
+test.ph <- cox.zph(cox_model)
+test.ph
+ggcoxzph(test.ph)
+```
+
+```{r}
+# Subgroup analyses - define subgroups
+ehr$strategy <- as.factor(ehr$strategy)
+ehr$concordance <- as.factor(ehr$concordance)
+ehr$pharmacological <- as.factor(ehr$pharmacological)
+ehr$inpatient <- as.factor(ehr$inpatient)
+ehr$ihd <- as.factor(ehr$ihd)
+ehr$year <- as.factor(ehr$year)
+ehr$pce_group <- as.factor(ifelse(ehr$pce<0.05, "a - <4.9%",
+                      ifelse((ehr$pce>=0.05)&(ehr$pce<0.075), "b - 5%-7.4%",
+                          ifelse((ehr$pce>=0.075)&(ehr$pce<0.20), "c - 7.5%-19.9%", "d - 20% or greater"))))
+ehr$cardiac_test_spec <- as.factor(ehr$cardiac_test_spec)
+```
+
+```{r}
+# By PCE profile
+table(ehr$pce_group)
+sub_cox <- subgroupAnalysis(cox_model, data = ehr, treatment = "concordance", subgroups = c("pce_group"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_pce.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By year                        
+sub_cox <- subgroupAnalysis(cox_model, data = ehr, treatment = "concordance", subgroups = c("year"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_year.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By functional test    
+functional <- ehr[ehr$strategy=="functional",]
+functional$test <- ifelse(functional$cardiac_test_spec=="spect", "nuc",
+                          ifelse(functional$cardiac_test_spec=="pet", "nuc",
+                          ifelse(functional$cardiac_test_spec=="cmr_stress", "cmr",
+                          ifelse(functional$cardiac_test_spec=="ett", "ett",
+                          ifelse(functional$cardiac_test_spec=="echo_stress", "echo_stress", "other")))))
+functional$test <- as.factor(functional$test)              
+sub_cox <- subgroupAnalysis(cox_model, data=functional, treatment="concordance", subgroups=c("test"))
+sub_cox
+plot_width <- 7 
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_test.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By pharm vs exercise                      
+sub_cox <- subgroupAnalysis(cox_model, data=ehr, treatment="concordance", subgroups=c("pharmacological"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_pharm.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By age
+ehr$age65 <- as.factor(ifelse(ehr$age<65, "<65 years", ">=65 years"))
+sub_cox <- subgroupAnalysis(cox_model, data=ehr, treatment="concordance", subgroups=c("age65"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_age.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By sex
+ehr$female <- as.factor(ifelse(ehr$sex.2==1, "female", "male"))
+sub_cox <- subgroupAnalysis(cox_model, data=ehr, treatment="concordance", subgroups=c("female"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_sex.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By dm
+ehr$diab.1 <- as.factor(ehr$diab.1)
+sub_cox <- subgroupAnalysis(cox_model, data=ehr, treatment="concordance", subgroups=c("diab.1"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_dm.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# By inpatient                     
+sub_cox <- subgroupAnalysis(cox_model, data=ehr, treatment="concordance", subgroups=c("inpatient"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_inpatient.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# iHD                     
+sub_cox <- subgroupAnalysis(cox_model, data=ehr, treatment="concordance", subgroups=c("ihd"))
+sub_cox
+plot_width <- 7
+plot_height <- 5
+png(filename="/path-to-output/ehr_by_ihd.png", 
+    width=plot_width*300, height=plot_height*300, res=300)
+plot(sub_cox)
+dev.off()
+```
+
+```{r}
+# Plot adjusted survival curves
+table(ehr$concordance)
+ehr$time_to_MACE2_2_years <- (ehr$time_to_MACE2_2/365.25)
+cox_model_stratified <- coxph(Surv(time_to_MACE2_2_years, MACE2_2) ~ strata(concordance) + age + sex.2 + ethnicity + race + bmi + choles + hdl + htn.1 + diab.1 + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3 + propensity_score, data = ehr)
+survival_probs_stratified <- survfit(cox_model_stratified)
+my_plot <- ggsurvplot(survival_probs_stratified, 
+           ylim = c(0, 0.12),
+           ylab = "Primary outcome (AMI or death)",
+           xlab = "Time (in years) since initial test",
+           fun = "cumhaz",
+           risk.table = TRUE,
+           font.main = c(12, "plain", "black"), 
+           font.submain = c(12, "plain", "black"), 
+           font.caption = c(12, "plain", "black"), 
+           font.legend = c(12, "plain", "black"), 
+           font.x = c(12, "plain", "black"),
+           font.y = c(12, "plain", "black"),
+           font.tickslab = c(12, "plain", "black"),
+           data=ehr)
+my_plot
+ggsave("/path-to-output/ehr_mace2_curves_20240115.pdf", plot = my_plot$plot, width = 8, height = 6, units = "in", dpi = 300)
+ggsave("/path-to-output/ehr_mace2_risk_20240115.pdf", plot = my_plot$table, width = 8, height = 2, units = "in", dpi = 300)
+```

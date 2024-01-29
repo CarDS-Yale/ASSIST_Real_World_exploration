@@ -1,0 +1,241 @@
+---
+title: "R markdown document for ASSIST predictions of the UKB extract"
+output: html_document
+---
+```{r}
+# Clean environment
+rm(list=ls())
+
+# install packages
+#install.packages(c("dplyr", "knitr", "tableone", "pollster", "pscl", "Matrix"))
+#install.packages("survival", dependencies = TRUE)
+#install.packages("missRanger", dependencies = TRUE)
+#install.packages("rmarkdown")
+#install.packages("knitr")
+#install.packages("xgboost")
+#install.packages("ggplot2")
+#install.packages("survminer")
+
+# Load packages
+library(dplyr)
+library(knitr)
+library(tableone)
+library(pollster)
+library(pscl)
+library(Matrix)
+library(survival)
+library(missRanger)
+library(xgboost)
+library(ggplot2)
+library(survminer)
+```
+
+## Load & preprocess the models and data
+```{r}
+# Load ASSIST model and show the feature names expected by the model
+assist <- readRDS("/path-to-assist-xgboost/xgboost.rds")
+assist$feature_names
+
+# Load CSV file for UKB
+ukb <- read.csv(file="/path-to-ukb-file/ukb_v2_20240115.csv")
+
+# Create TableOne
+ukb$cabg_pci = ifelse((ukb$cabg==1)|(ukb$pci==1), 1, 0)
+
+tableOne <- CreateTableOne(vars = c("age", "sex.2", "bmi", "ethnicity", "first_test_type",
+                                    "htn.1", "diab.1", "ihd.1", "cabg_pci", "ami.1", "pad.1", "stroke.1", "ckd.1", "hf.1",
+                                    "betablk_1.1", "statin_1.1", "antiplatelet_1.1", 
+                                    "smoke.3", "smoke.2", "choles", "hdl", "strategy"), 
+                            factorVars = c("sex.2", "ethnicity", "first_test_type",
+                                    "htn.1", "diab.1", "ihd.1", "cabg_pci", "ami.1", "pad.1", "stroke.1", "ckd.1", "hf.1",
+                                    "betablk_1.1", "statin_1.1", "antiplatelet_1.1", 
+                                    "smoke.3", "smoke.2", "strategy"), 
+                           data = ukb, strata=c("strategy"), test=TRUE)
+
+tableOne_mat <- print(tableOne, #nonnormal = c("age", "bmi", "choles", "hdl"), 
+                      smd=TRUE, digits = 1)
+write.csv(tableOne_mat, "/path-to-output/tableOne_20240115.csv", row.names = TRUE)
+```
+
+```{r}
+# Imputation
+set.seed(123)
+ukb_forimput <- ukb %>% select("age", "sex.2", "bmi", "ethnicity",
+                                    "htn.1", "diab.1", "ihd.1", "ami.1", "pad.1", "stroke.1", "ckd.1", "hf.1",
+                                    "betablk_1.1", "statin_1.1", "antiplatelet_1.1", 
+                                    "smoke.3", "smoke.2", "choles", "hdl")
+imputed_values <- missRanger(ukb_forimput)
+
+ukb$choles <- imputed_values[, "choles"]
+ukb$hdl <- imputed_values[, "hdl"]
+ukb$bmi <- imputed_values[,"bmi"]
+table(ukb$first_test_type)
+```
+
+```{r}
+# Define outcome variables
+ukb["Death_MI"] <- as.numeric(ifelse(ukb["Death"]==1|ukb["MI"]==1, 1, 0))
+ukb["CVDeath_MI"] <- as.numeric(ifelse(ukb["CVDeath"]==1|ukb["MI"]==1, 1, 0))
+table(ukb["Death_MI"])
+table(ukb["CVDeath_MI"])
+table(ukb["MI"])
+table(ukb["Death"])
+summary(ukb["Time2Death_MI"]/365.25)
+```
+
+```{r}
+# Keep covariates for prediction
+ukb_predictors <- ukb[assist$feature_names]
+
+# perform imputation
+set.seed(123)
+ukb_predictors_imp <- missRanger(ukb_predictors)
+
+# Create dataframe for inference
+nhr <- rnorm(nrow(ukb_predictors_imp), 1, 0.5) # create dummy label
+ukb_predictors_imp <- cbind(nhr, ukb_predictors_imp) # merge
+new_tst <- sparse.model.matrix(nhr ~ .-1, data = ukb_predictors_imp) # create matrix for prediction
+```
+
+```{r}
+# See how many functional vs anatomical-first cases we have
+table(ukb$strategy)
+```
+
+```{r}
+# get inference from xgboost
+ukb$prediction <- predict(assist, newdata = new_tst)
+ukb$assist_rec <- ifelse(ukb$prediction<0, "anatomical", "functional")
+
+# show distribution of inference
+hist(ukb$prediction)
+table(ukb$assist_rec)
+```
+
+
+```{r}
+# create propensity score
+ukb$anatomical <- ifelse(ukb$strategy=="anatomical", 1, 0)
+ukb$year_first_test_date <- as.factor(as.integer(substr(ukb$first_test_date, 1, 4)))
+model_prop <- glm(anatomical ~ age + sex.2 + ethnicity + bmi 
+                  + year_first_test_date
+                  + choles + hdl + htn.1 + diab.1 + ihd.1 + ckd.1
+                  + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3,
+                  family = binomial, data = ukb)
+summary(model_prop)
+propensity_scores <- predict(model_prop, type = "response")
+
+# change scale
+ukb$propensity_score <- propensity_scores*100
+ukb$choles10 <- ukb$choles/10
+ukb$hdl10 <- ukb$hdl/10
+ukb$age10 <- ukb$age/10
+ukb$bmi10 <- ukb$bmi/10
+
+# create reference groups
+ukb$ethnicity <- factor(ukb$ethnicity)
+ukb$ethnicity<- relevel(ukb$ethnicity, ref = "White")
+```
+
+```{r}
+# Estimate (McFadden's pseudo-R2)
+with(summary(model_prop), 1 - deviance/null.deviance)
+```
+
+```{r}
+# create discrepancy flag
+ukb$concordance <- ifelse(ukb$assist_rec=="anatomical" & ukb$strategy=="anatomical", 1,
+                          ifelse(ukb$assist_rec=="functional" & ukb$strategy=="functional", 1, 0))
+
+# Identify predictors of concordance vs discordance
+model_conc <- glm(concordance ~ age10 + sex.2 + bmi10 + ethnicity 
+             + choles10 + hdl10 + htn.1 + diab.1 + ihd.1 + ckd.1
+             + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3
+             #+ propensity_score,
+             ,family=binomial, data = ukb)
+summary_model <- summary(model_conc)
+summary_model
+odds_ratios <- exp(coef(model_conc))
+ci <- exp(confint(model_conc))
+p_values <- summary_model$coefficients[, "Pr(>|z|)"]
+se <- summary_model$coefficients[, "Std. Error"]
+beta <- summary_model$coefficients[, "Estimate"]
+
+results_df <- data.frame(
+  Variable = names(odds_ratios),
+  Beta = beta,
+  SE = se,
+  OR = odds_ratios,
+  CI_low = ci[, 1],
+  CI_high = ci[, 2],
+  P_value = p_values
+)
+results_df$CI_formatted <- paste("Beta (SE): ", round(results_df$Beta, 2), " (", round(results_df$SE, 2), "); ", round(results_df$OR, 2), "[95% CI:", round(results_df$CI_low, 2), "-", round(results_df$CI_high, 2), "],", round(results_df$P_value, 4))
+write.csv(results_df, file = "/path-to-output/conc_model_results_20240115.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+# Summarize concordance
+table(ukb$concordance)
+```
+
+```{r}
+# Summarize ASSIST recommended strategy
+table(ukb$assist_rec)
+```
+
+```{r}
+# Primary: all-cause mortality + AMI
+model_death_mi <- coxph(Surv(Time2Death_MI, Death_MI) ~ concordance + age + sex.2 + bmi + ethnicity
+             + choles + hdl + htn.1 + diab.1 + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3
+             + propensity_score, data = ukb)
+summary(model_death_mi)
+```
+
+```{r}
+# Assess whether proportionality assumption is violated
+cox_model <- model_death_mi
+test.ph <- cox.zph(cox_model)
+test.ph
+ggcoxzph(test.ph)
+```
+
+```{r}
+# Secondary: CV-specific mortality
+model_death_mi <- coxph(Surv(Time2Death, CV_death) ~ concordance + age + sex.2 + bmi + ethnicity
+             + choles + hdl + htn.1 + diab.1 + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3
+             + propensity_score, data = ukb)
+summary(model_death_mi)
+```
+
+```{r}
+sapply(ukb, function(x) if(is.matrix(x)) "matrix" else class(x))
+table(ukb$Death_MI)
+```
+
+```{r}
+ukb$Time2Death_MI_years <- ukb$Time2Death_MI/365.25
+model_death_mi <- coxph(Surv(Time2Death_MI_years, Death_MI) ~ strata(concordance) + age + sex.2 + bmi + ethnicity
+             + choles + hdl + htn.1 + diab.1 + antiplatelet_1.1 + statin_1.1 + betablk_1.1 + smoke.2 + smoke.3
+             + propensity_score, data = ukb)
+survival_probs <- survfit(model_death_mi)
+my_plot <- ggsurvplot(survival_probs, 
+           ylim = c(0, 0.2),
+           ylab = "Primary outcome (AMI or death)",
+           xlab = "Time (in years) since initial test",
+           fun = "cumhaz",
+           risk.table = TRUE,
+           font.main = c(12, "plain", "black"), 
+           font.submain = c(12, "plain", "black"), 
+           font.caption = c(12, "plain", "black"), 
+           font.legend = c(12, "plain", "black"), 
+           font.x = c(12, "plain", "black"),
+           font.y = c(12, "plain", "black"),
+           font.tickslab = c(12, "plain", "black"),
+           data=ukb)
+my_plot
+ggsave("/path-to-output/ehr_mace2_curves_20240115.pdf", plot = my_plot$plot, width = 8, height = 6, units = "in", dpi = 300)
+ggsave("/path-to-output/ehr_mace2_risk_20240115.pdf", plot = my_plot$table, width = 8, height = 2, units = "in", dpi = 300)
+```
